@@ -1,0 +1,20 @@
+# Локальные данные и выгрузки
+*.dump
+*.sql
+*.backup
+analytics_backup
+
+# Секреты и локальные настройки
+.env
+.env.*
+!.env.example
+secrets/
+
+# Служебные файлы
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
