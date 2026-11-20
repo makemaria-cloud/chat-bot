@@ -9,7 +9,7 @@ from pathlib import Path
 
 KINDS = {"message", "human", "closed", "stop"}
 BLOCKED = {"HUMAN_ACTIVE", "CLOSED", "DO_NOT_CONTACT"}
-MIGRATIONS = ("001.sql", "002.sql", "003.sql")
+MIGRATIONS = ("001.sql", "002.sql", "003.sql", "004.sql")
 
 
 class EventConflict(ValueError):
@@ -92,7 +92,7 @@ class Store:
         if previous[1] == revision and previous != head:
             raise EventConflict("Несовместимые данные об актуальной сессии")
 
-    def process_one(self):
+    def process_one(self, planner=None):
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -103,11 +103,13 @@ class Store:
                 return False
             sequence, portal, chat, session, kind, context = row
             key = (portal, chat, session)
+            current = None
             if context is not None and kind == "message":
                 current = db.execute(
-                    "SELECT session, owner FROM chat_heads WHERE (portal, chat) = (?, ?)", (portal, chat)
+                    "SELECT session, owner, revision FROM chat_heads WHERE (portal, chat) = (?, ?)",
+                    (portal, chat),
                 ).fetchone()
-                if current != (session, "bot"):
+                if current is None or current[:2] != (session, "bot"):
                     db.execute("UPDATE inbox SET processed = 1 WHERE sequence = ?", (sequence,))
                     return True
             previous = db.execute(
@@ -115,10 +117,16 @@ class Store:
             ).fetchone()
             state = transition(previous[0] if previous else "NEW", kind)
             db.execute(
-                """INSERT INTO sessions VALUES (?, ?, ?, ?)
-                   ON CONFLICT (portal, chat, session) DO UPDATE SET state = excluded.state""",
-                (*key, state),
+                """INSERT INTO sessions (portal, chat, session, state, version) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT (portal, chat, session) DO UPDATE SET
+                       state = excluded.state, version = excluded.version""",
+                (*key, state, sequence),
             )
+            if planner is not None and current is not None and state not in BLOCKED:
+                from outbox import enqueue_actions
+
+                metadata = json.loads(context)
+                enqueue_actions(db, key, current[2], sequence, metadata, planner(metadata))
             db.execute("UPDATE inbox SET processed = 1 WHERE sequence = ?", (sequence,))
             return True
 
@@ -206,6 +214,7 @@ def main():
     serve_command.add_argument("--bitrix-fixture", type=Path)
     worker_command = commands.add_parser("worker")
     worker_command.add_argument("--once", action="store_true")
+    commands.add_parser("outbox-review")
     args = parser.parse_args()
     store = Store(args.db)
     store.migrate()
@@ -217,12 +226,18 @@ def main():
 
         webhook = fixture_webhook(store, args.bitrix_fixture) if args.bitrix_fixture else None
         serve(store, args.port, webhook)
-    else:
+    elif args.command == "worker":
         while True:
             if not store.process_one():
                 if args.once:
                     break
                 time.sleep(0.25)
+    else:
+        from outbox import Dispatcher
+
+        dispatcher = Dispatcher(store)
+        dispatcher.recover_expired()
+        print(json.dumps(dispatcher.review_queue()))
 
 
 if __name__ == "__main__":

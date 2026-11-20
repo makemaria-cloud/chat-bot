@@ -82,7 +82,7 @@ class StoreTest(unittest.TestCase):
         while self.store.process_one():
             pass
         with closing(self.store.connect()) as db:
-            self.assertEqual(set(db.execute("SELECT * FROM sessions")), {
+            self.assertEqual(set(db.execute("SELECT portal, chat, session, state FROM sessions")), {
                 ("demo", "1", "2", "DO_NOT_CONTACT"),
                 ("separate", "1", "2", "QUALIFYING"),
                 ("demo", "separate", "2", "QUALIFYING"),
