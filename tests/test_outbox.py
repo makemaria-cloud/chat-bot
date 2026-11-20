@@ -218,6 +218,81 @@ class OutboxTest(unittest.TestCase):
         self.assertEqual(self.fake.calls[-1].session, "322")
         self.assertEqual(self.fake.calls[-1].params, {"entityTypeId": 1, "id": 17, "fields": {"quantity": 4}})
 
+    def test_crm_bind_recovers_update_after_message_without_new_fields(self):
+        for offset, later_plan in enumerate((Plan(reply="Тестовый ответ"), Plan(), None)):
+            with self.subTest(later_plan=later_plan):
+                chat = str(int(KEY[1]) + offset)
+                with closing(self.store.connect()) as db, db:
+                    self.assertTrue(record_crm_link(db, (KEY[0], chat, KEY[2]), 1, 17))
+                self.plan(Plan(crm_fields={"quantity": 2}), chat=chat)
+                self.plan(later_plan, "791", chat=chat)
+                self.drain(self.dispatch)
+                projection_id = next(row["id"] for row in self.dispatch.review_queue()
+                                     if row["kind"] == "crm_projection")
+                restarted = Dispatcher(Store(self.path), approved_scope=SCOPE, transport=self.fake, verify=lambda _: True)
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    self.assertTrue(all(pool.map(lambda _: restarted.bind_crm(projection_id, 1, 17), range(8))))
+                self.fake.outcome = Outcome("confirmed")
+                self.drain(restarted)
+                self.assertTrue(restarted.bind_crm(projection_id, 1, 17))
+                self.assertFalse(restarted.dispatch_one())
+                updates = [call for call in self.fake.calls if call.chat == chat and call.kind.startswith("crm_")]
+                self.assertEqual([(action.kind, action.params["fields"]) for action in updates],
+                                 [("crm_update", {"quantity": 2})])
+
+    def test_crm_bind_recovers_latest_projection_after_another_version_change(self):
+        with closing(self.store.connect()) as db, db:
+            self.assertTrue(record_crm_link(db, KEY, 1, 17))
+        self.plan(Plan(crm_fields={"quantity": 2}))
+        self.plan(Plan(), "791")
+        self.drain(self.dispatch)
+        self.plan(Plan(crm_fields={"quantity": 4}), "792")
+        self.plan(Plan(), "793")
+        self.drain(self.dispatch)
+        self.assertTrue(self.dispatch.bind_crm(1, 1, 17))
+        self.plan(Plan(), "794")
+        self.drain(self.dispatch)
+        self.assertTrue(self.dispatch.bind_crm(1, 1, 17))
+        self.fake.outcome = Outcome("confirmed")
+        self.drain(self.dispatch)
+        self.assertEqual([action.params["fields"] for action in self.fake.calls], [{"quantity": 4}])
+        self.assertEqual(self.rows("SELECT status FROM outbox ORDER BY id"),
+                         [("cancelled",), ("cancelled",), ("cancelled",), ("confirmed",)])
+
+    def test_crm_bind_does_not_recover_update_after_controls_or_route_change(self):
+        for offset, change in enumerate(("human", "stop", "closed", "session", "route")):
+            with self.subTest(change=change):
+                chat = str(int(KEY[1]) + offset)
+                with closing(self.store.connect()) as db, db:
+                    self.assertTrue(record_crm_link(db, (KEY[0], chat, KEY[2]), 1, 17))
+                self.plan(Plan(crm_fields={"quantity": 2}), chat=chat)
+                if change == "session":
+                    self.plan(Plan(), "791", chat=chat, session="322", revision=2)
+                elif change == "route":
+                    event = dict(portal=KEY[0], chat=chat, session=KEY[2], message="791", kind="message")
+                    self.store.accept(event, context={**CONTEXT, "line": "13"}, head=("321", 1, "bot"))
+                    self.assertTrue(self.store.process_one())
+                else:
+                    self.event("791", change, chat=chat)
+                    self.assertTrue(self.store.process_one())
+                self.drain(self.dispatch)
+                self.assertTrue(self.dispatch.bind_crm(offset + 1, 1, 17))
+                self.assertFalse(self.dispatch.dispatch_one())
+        self.assertEqual(self.fake.calls, [])
+
+    def test_crm_bind_does_not_replace_in_flight_or_uncertain_update(self):
+        with closing(self.store.connect()) as db, db:
+            self.assertTrue(record_crm_link(db, KEY, 1, 17))
+        self.plan(Plan(crm_fields={"quantity": 2}))
+        attempt = self.dispatch.claim()
+        self.plan(Plan(), "791")
+        self.assertTrue(self.dispatch.bind_crm(1, 1, 17))
+        self.assertFalse(self.dispatch.dispatch_one())
+        self.dispatch.finish(attempt, Outcome("uncertain", "timeout"))
+        self.assertTrue(self.dispatch.bind_crm(1, 1, 17))
+        self.assertFalse(self.dispatch.dispatch_one())
+        self.assertEqual(self.rows("SELECT status FROM outbox"), [("uncertain",)])
+
     def test_crm_edits_during_attempt_survive_restart_and_concurrent_confirmation(self):
         self.plan(Plan(crm_fields={"quantity": 2}, crm_create_type=1))
         attempt = self.dispatch.claim()

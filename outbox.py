@@ -150,17 +150,29 @@ def remember_crm(db, key, revision, version, route, plan):
     )
 
 
-def schedule_crm(db, key):
+def schedule_crm(db, key, *, recover_cancelled=False):
     desired = db.execute(
-        """SELECT id, revision, version, line, connector, fields, create_type
-           FROM crm_desired WHERE (portal, chat, session) = (?, ?, ?) AND action_id IS NULL""",
-        key,
+        """SELECT d.id, d.revision, d.version, d.line, d.connector, d.fields, d.create_type, o.id, o.version
+           FROM crm_desired AS d LEFT JOIN outbox AS o ON o.id = d.action_id
+           WHERE (d.portal, d.chat, d.session) = (?, ?, ?) AND (
+               d.action_id IS NULL OR (
+                   ? AND o.kind = 'crm_update' AND o.status = 'cancelled' AND o.reason = 'local_state_changed'
+                   AND (o.portal, o.chat, o.session, o.revision, o.line, o.connector) =
+                       (d.portal, d.chat, d.session, d.revision, d.line, d.connector)
+               )
+           )""",
+        (*key, recover_cancelled),
     ).fetchone()
     if desired is None:
         return
-    desired_id, revision, version, line, connector, fields, create_type = desired
+    desired_id, revision, version, line, connector, fields, create_type, cancelled_id, cancelled_version = desired
     current = session_version(db, key, revision)
     binding = crm_link(db, key)
+    if cancelled_id is not None and (
+        binding is None or current is None or current <= cancelled_version
+        or not crm_route_unchanged(db, key, cancelled_version, line, connector)
+    ):
+        return
     reason = crm_wait_reason(db, key, current, binding, create_type)
     if reason:
         db.execute("UPDATE crm_desired SET reason = ? WHERE id = ?", (reason, desired_id))
@@ -169,8 +181,21 @@ def schedule_crm(db, key):
     if binding:
         params["id"] = binding[1]
     kind = "crm_update" if binding else "crm_create"
-    action_id = insert_action(db, key, revision, current, (line, connector), kind, str(version), params)
+    # Одна новая попытка на одну отменённую запись, с сохранением истории.
+    dedup = str(version) if cancelled_id is None else f"recovery:{cancelled_id}"
+    action_id = insert_action(db, key, revision, current, (line, connector), kind, dedup, params)
     db.execute("UPDATE crm_desired SET action_id = ?, reason = NULL WHERE id = ?", (action_id, desired_id))
+
+
+def crm_route_unchanged(db, key, previous_version, line, connector):
+    return not db.execute(
+        """SELECT EXISTS (
+               SELECT 1 FROM inbox WHERE (portal, chat, session) = (?, ?, ?)
+                 AND sequence > ? AND kind = 'message'
+                 AND (json_extract(context, '$.line') IS NOT ? OR json_extract(context, '$.connector') IS NOT ?)
+           )""",
+        (*key, previous_version, line, connector),
+    ).fetchone()[0]
 
 
 def reconsider_crm(db, key):
@@ -390,7 +415,7 @@ class Dispatcher:
                    )""",
                 (projection_id,),
             )
-            schedule_crm(db, key)
+            schedule_crm(db, key, recover_cancelled=True)
             return True
 
     def retry_handoff(self, failed_action_id):
