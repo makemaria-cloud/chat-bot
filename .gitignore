@@ -1,8 +1,10 @@
 # Локальные данные и выгрузки
 *.dump
 *.sql
+!migrations/001.sql
 *.backup
 analytics_backup
+*.sqlite3*
 
 # Секреты и локальные настройки
 .env
@@ -17,4 +19,3 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
-
