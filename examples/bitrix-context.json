@@ -1,0 +1,15 @@
+{
+  "domain": "demo.example",
+  "bot_id": "456",
+  "routes": [["12", "synthetic-avito"]],
+  "chats": {
+    "112": {
+      "line": "12",
+      "connector": "synthetic-avito",
+      "head": ["321", 1, "bot"],
+      "messages": {
+        "790": {"session": "321", "author": "27", "role": "client"}
+      }
+    }
+  }
+}

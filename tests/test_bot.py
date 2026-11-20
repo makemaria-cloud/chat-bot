@@ -10,7 +10,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from threading import Thread
 
-from bot import EventConflict, Store, make_server
+from bot import MIGRATIONS, EventConflict, Store, make_server
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -130,7 +130,7 @@ class StoreTest(unittest.TestCase):
         upgraded.migrate()
         upgraded.migrate()
         with closing(upgraded.connect()) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (2,))
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (len(MIGRATIONS),))
             indexes = [row[1] for row in db.execute("PRAGMA index_list(inbox)") if row[2]]
             self.assertEqual(len(indexes), 1)
             key = [row[2] for row in db.execute("SELECT * FROM pragma_index_info(?)", indexes)]
