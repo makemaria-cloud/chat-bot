@@ -1,7 +1,7 @@
 # Локальные данные и выгрузки
 *.dump
 *.sql
-!migrations/001.sql
+!/migrations/[0-9][0-9][0-9].sql
 *.backup
 analytics_backup
 *.sqlite3*

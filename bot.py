@@ -8,6 +8,11 @@ from pathlib import Path
 
 KINDS = {"message", "human", "closed", "stop"}
 BLOCKED = {"HUMAN_ACTIVE", "CLOSED", "DO_NOT_CONTACT"}
+MIGRATIONS = ("001.sql", "002.sql")
+
+
+class EventConflict(ValueError):
+    """Несовместимые данные для уже принятого события."""
 
 
 class Store:
@@ -21,33 +26,51 @@ class Store:
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version == 1:
-                return
-            if version != 0:
+            if not 0 <= version <= len(MIGRATIONS):
                 raise RuntimeError("Неизвестная версия схемы")
-            migration = Path(__file__).with_name("migrations") / "001.sql"
-            for statement in migration.read_text(encoding="utf-8").split(";"):
+            directory = Path(__file__).with_name("migrations")
+            for number, filename in enumerate(MIGRATIONS[version:], start=version + 1):
+                statement = ""
+                for line in (directory / filename).read_text(encoding="utf-8").splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        db.execute(statement)
+                        statement = ""
                 if statement.strip():
-                    db.execute(statement)
-            db.execute("PRAGMA user_version = 1")
+                    raise RuntimeError(f"Незавершённая миграция {filename}")
+                db.execute(f"PRAGMA user_version = {number}")
 
     def accept(self, event):
         keys = ("portal", "chat", "session", "message", "kind")
-        if not isinstance(event, dict) or set(event) != set(keys):
+        if not isinstance(event, dict) or set(event) - {"event_id"} != set(keys):
             raise ValueError("Неверный формат события")
         values = tuple(event[key] for key in keys)
-        if any(not isinstance(value, str) or not value.strip() or len(value) > 128 for value in values):
+        event_id = event.get("event_id", event["message"])
+        if any(
+            not isinstance(value, str) or not value.strip() or len(value) > 128
+            for value in (*values, event_id)
+        ):
             raise ValueError("Неверное значение поля")
         if event["kind"] not in KINDS:
             raise ValueError("Неизвестный тип события")
+        portal, chat, session, message, kind = values
         with closing(self.connect()) as db, db:
             result = db.execute(
-                """INSERT INTO inbox (portal, chat, session, message, kind)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT (portal, chat, session, message) DO NOTHING""",
-                values,
+                """INSERT INTO inbox (portal, chat, session, message, kind, event_id)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (portal, chat, session, kind, event_id) DO NOTHING""",
+                (*values, event_id),
             )
-            return result.rowcount == 1
+            if result.rowcount == 1:
+                return True
+            previous = db.execute(
+                """SELECT message FROM inbox
+                   WHERE (portal, chat, session, kind, event_id) = (?, ?, ?, ?, ?)""",
+                (portal, chat, session, kind, event_id),
+            ).fetchone()
+            if previous != (message,):
+                raise EventConflict("Идентификатор события уже связан с другим сообщением")
+            return False
 
     def process_one(self):
         with closing(self.connect()) as db, db:
@@ -95,7 +118,7 @@ def replay(store, lines):
     return {"accepted": accepted, "processed": processed}
 
 
-def serve(store, port):
+def make_server(store, port):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/health":
@@ -120,7 +143,11 @@ def serve(store, port):
             # Путь запроса может содержать данные, которые нельзя писать в лог.
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", port), Handler) as server:
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def serve(store, port):
+    with make_server(store, port) as server:
         server.serve_forever()
 
 
