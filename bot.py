@@ -9,7 +9,7 @@ from pathlib import Path
 
 KINDS = {"message", "human", "closed", "stop"}
 BLOCKED = {"HUMAN_ACTIVE", "CLOSED", "DO_NOT_CONTACT"}
-MIGRATIONS = ("001.sql", "002.sql", "003.sql", "004.sql")
+MIGRATIONS = ("001.sql", "002.sql", "003.sql", "004.sql", "005.sql")
 
 
 class EventConflict(ValueError):
@@ -215,6 +215,15 @@ def main():
     worker_command = commands.add_parser("worker")
     worker_command.add_argument("--once", action="store_true")
     commands.add_parser("outbox-review")
+    confirm_command = commands.add_parser("outbox-confirm")
+    confirm_command.add_argument("action_id", type=int)
+    confirm_command.add_argument("--crm-item", type=int)
+    binding_command = commands.add_parser("crm-bind")
+    binding_command.add_argument("projection_id", type=int)
+    binding_command.add_argument("entity_type", type=int)
+    binding_command.add_argument("item_id", type=int)
+    retry_command = commands.add_parser("handoff-retry")
+    retry_command.add_argument("action_id", type=int)
     args = parser.parse_args()
     store = Store(args.db)
     store.migrate()
@@ -236,8 +245,19 @@ def main():
         from outbox import Dispatcher
 
         dispatcher = Dispatcher(store)
-        dispatcher.recover_expired()
-        print(json.dumps(dispatcher.review_queue()))
+        if args.command == "outbox-review":
+            dispatcher.recover_expired()
+            print(json.dumps(dispatcher.review_queue()))
+            return
+        if args.command == "outbox-confirm":
+            changed = dispatcher.confirm(args.action_id, crm_item=args.crm_item)
+        elif args.command == "crm-bind":
+            changed = dispatcher.bind_crm(args.projection_id, args.entity_type, args.item_id)
+        else:
+            changed = dispatcher.retry_handoff(args.action_id)
+        print(json.dumps({"applied": changed}))
+        if not changed:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -7,10 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest.mock import patch
 
 from bitrix_rest import BitrixRest, interpret_response
-from bot import Store
-from outbox import Action, Dispatcher, Outcome, Plan, record_crm_link
+from bot import MIGRATIONS, Store
+from outbox import HANDOFF_COOLDOWN, Action, Dispatcher, Outcome, Plan, record_crm_link
 
 SCOPE = ("demo.example", "12", "synthetic-avito")
 KEY = (SCOPE[0], "112", "321")
@@ -199,6 +200,162 @@ class OutboxTest(unittest.TestCase):
         self.plan(Plan(crm_fields={"synthetic": "value"}))
         self.assertFalse(self.dispatch.dispatch_one())
         self.assertEqual(self.rows("SELECT kind FROM outbox"), [])
+
+    def test_new_crm_session_waits_for_its_own_verified_binding(self):
+        self.plan(Plan(crm_fields={"quantity": 2}, crm_create_type=1))
+        self.fake.outcome = Outcome("confirmed", crm_item=17)
+        self.assertTrue(self.dispatch.dispatch_one())
+        self.plan(Plan(crm_fields={"quantity": 4}, crm_create_type=1), "791", session="322", revision=2)
+        self.assertFalse(self.dispatch.dispatch_one())
+        self.assertEqual(self.dispatch.review_queue(), [
+            {"id": 2, "kind": "crm_projection", "status": "deferred", "reason": "waiting_session_binding"},
+        ])
+        self.assertEqual(self.rows("SELECT session, item FROM crm_links"), [("321", 17)])
+        self.assertTrue(Dispatcher(Store(self.path)).bind_crm(2, 1, 17))
+        self.fake.outcome = Outcome("confirmed")
+        self.assertTrue(self.dispatch.dispatch_one())
+        self.assertEqual([call.kind for call in self.fake.calls], ["crm_create", "crm_update"])
+        self.assertEqual(self.fake.calls[-1].session, "322")
+        self.assertEqual(self.fake.calls[-1].params, {"entityTypeId": 1, "id": 17, "fields": {"quantity": 4}})
+
+    def test_crm_edits_during_attempt_survive_restart_and_concurrent_confirmation(self):
+        self.plan(Plan(crm_fields={"quantity": 2}, crm_create_type=1))
+        attempt = self.dispatch.claim()
+        self.plan(Plan(crm_fields={"quantity": 3, "region": "demo"}, crm_create_type=1), "791")
+        self.assertFalse(self.dispatch.dispatch_one())
+        self.dispatch.finish(attempt, Outcome("uncertain", "timeout"))
+        for index in range(792, 795):
+            data = dict(portal=KEY[0], chat=KEY[1], session=KEY[2], message=str(index), kind="message")
+            context = {**CONTEXT, "text": str(index)}
+            self.assertTrue(self.store.accept(data, context=context, head=("321", 1, "bot")))
+        self.assertFalse(self.store.accept(data, context=context, head=("321", 1, "bot")))
+
+        def process(_):
+            return Store(self.path).process_one(lambda context: Plan(crm_fields={"quantity": int(context["text"])}))
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            self.assertEqual(sum(pool.map(process, range(8))), 3)
+        restarted = Dispatcher(Store(self.path), approved_scope=SCOPE, transport=self.fake, verify=lambda _: True)
+        self.assertEqual(restarted.review_queue()[-1], {
+            "id": 1, "kind": "crm_projection", "status": "deferred", "reason": "crm_attempt_unresolved",
+        })
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            self.assertEqual(sum(pool.map(lambda _: restarted.confirm(1, crm_item=17), range(8))), 1)
+        self.fake.outcome = Outcome("confirmed")
+        self.drain(restarted)
+        self.assertEqual([call.kind for call in self.fake.calls], ["crm_update"])
+        self.assertEqual(self.fake.calls[0].params["fields"], {"quantity": 794, "region": "demo"})
+        self.assertEqual(self.rows("SELECT kind, status FROM outbox ORDER BY id"), [
+            ("crm_create", "confirmed"), ("crm_update", "confirmed"),
+        ])
+
+    def test_create_success_releases_edits_queued_while_api_was_running(self):
+        self.plan(Plan(crm_fields={"quantity": 2}, crm_create_type=1))
+        attempt = self.dispatch.claim()
+        self.plan(Plan(crm_fields={"quantity": 3}), "791")
+        self.dispatch.finish(attempt, Outcome("confirmed", crm_item=17))
+        self.fake.outcome = Outcome("confirmed")
+        self.assertTrue(self.dispatch.dispatch_one())
+        self.assertEqual(self.fake.calls[0].params, {"entityTypeId": 1, "id": 17, "fields": {"quantity": 3}})
+
+    def test_controls_and_new_session_guard_crm_update_and_reply_after_confirmation(self):
+        for index, kind in enumerate(("human", "stop", "new_session"), start=1):
+            with self.subTest(kind=kind):
+                chat = str(112 + index)
+                self.plan(Plan(crm_fields={"quantity": 2}, crm_create_type=1), chat=chat)
+                attempt = self.dispatch.claim()
+                self.dispatch.finish(attempt, Outcome("uncertain", "timeout"))
+                self.plan(Plan(reply="Старый ответ", crm_fields={"quantity": 3}), "791", chat=chat)
+                self.assertTrue(self.dispatch.confirm(attempt.id, crm_item=17))
+                if kind == "new_session":
+                    self.plan(Plan(), "792", chat=chat, session="322", revision=2)
+                else:
+                    self.event("792", kind, chat=chat)
+                    self.assertTrue(self.store.process_one())
+                self.drain(self.dispatch)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.rows("SELECT count(*) FROM outbox WHERE status = 'cancelled'"), [(6,)])
+        self.assertEqual(sum(row["kind"] == "crm_projection" for row in self.dispatch.review_queue()), 3)
+
+    def test_handoff_recovery_needs_new_request_cooldown_and_one_approval(self):
+        for index, failure in enumerate(("rate_limited", "permission_denied"), start=1):
+            with self.subTest(failure=failure):
+                chat = str(112 + index)
+                self.plan(Plan(handoff=True), chat=chat)
+                self.fake.outcome = Outcome("not_sent", failure)
+                with patch("outbox.time.time", return_value=100):
+                    self.assertTrue(self.dispatch.dispatch_one())
+                failed_id = self.fake.calls[-1].id
+                restarted = Dispatcher(Store(self.path), approved_scope=SCOPE, transport=self.fake, verify=lambda _: True)
+                with patch("outbox.time.time", return_value=100 + HANDOFF_COOLDOWN):
+                    self.assertFalse(restarted.retry_handoff(failed_id))
+                self.plan(Plan(handoff=True), "791", chat=chat)
+                self.plan(Plan(handoff=True), "792", chat=chat)
+                self.assertFalse(restarted.dispatch_one())
+                self.assertIn({"id": failed_id, "kind": "handoff_request", "status": "deferred", "reason": failure},
+                              restarted.review_queue())
+                with patch("outbox.time.time", return_value=100 + HANDOFF_COOLDOWN - 1):
+                    self.assertFalse(restarted.retry_handoff(failed_id))
+                with patch("outbox.time.time", return_value=100 + HANDOFF_COOLDOWN):
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        self.assertEqual(sum(pool.map(lambda _: restarted.retry_handoff(failed_id), range(8))), 1)
+                self.fake.outcome = Outcome("api_accepted")
+                self.assertTrue(restarted.dispatch_one())
+                self.assertFalse(restarted.dispatch_one())
+                self.assertEqual(self.rows("SELECT status FROM outbox WHERE chat = ? ORDER BY id", (chat,)),
+                                 [("not_sent",), ("api_accepted",)])
+
+    def test_handoff_cannot_be_retried_after_ambiguous_or_accepted_outcome(self):
+        for index, outcome in enumerate((Outcome("uncertain", "timeout"), Outcome("api_accepted")), start=1):
+            with self.subTest(outcome=outcome):
+                chat = str(112 + index)
+                self.plan(Plan(handoff=True), chat=chat)
+                self.fake.outcome = outcome
+                with patch("outbox.time.time", return_value=100):
+                    self.assertTrue(self.dispatch.dispatch_one())
+                action_id = self.fake.calls[-1].id
+                self.plan(Plan(handoff=True), "791", chat=chat)
+                with patch("outbox.time.time", return_value=100 + HANDOFF_COOLDOWN):
+                    self.assertFalse(self.dispatch.retry_handoff(action_id))
+                    self.assertFalse(self.dispatch.dispatch_one())
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_handoff_recovery_rechecks_controls_before_queueing(self):
+        self.plan(Plan(handoff=True))
+        self.fake.outcome = Outcome("not_sent", "rate_limited")
+        with patch("outbox.time.time", return_value=100):
+            self.assertTrue(self.dispatch.dispatch_one())
+        self.plan(Plan(handoff=True), "791")
+        self.event("792", "stop")
+        with patch("outbox.time.time", return_value=100 + HANDOFF_COOLDOWN):
+            self.assertFalse(self.dispatch.retry_handoff(self.fake.calls[0].id))
+        self.assertFalse(self.dispatch.dispatch_one())
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_upgrade_of_v4_preserves_existing_outbox_and_crm_projection(self):
+        old = self.path.with_name("v4.sqlite3")
+        migrations = Path(__file__).resolve().parents[1] / "migrations"
+        with closing(sqlite3.connect(old)) as db, db:
+            for filename in MIGRATIONS[:4]:
+                db.executescript((migrations / filename).read_text(encoding="utf-8"))
+            db.execute("PRAGMA user_version = 4")
+            db.execute(
+                """INSERT INTO outbox (portal, chat, session, revision, version, line, connector,
+                                       kind, dedup, params, status, reason)
+                   VALUES (?, ?, ?, 1, 1, ?, ?, 'crm_create', '1', ?, 'uncertain', 'timeout'),
+                          (?, ?, ?, 1, 2, ?, ?, 'handoff', '2', '{}', 'not_sent', 'rate_limited')""",
+                (*KEY, *SCOPE[1:], json.dumps({"entityTypeId": 1, "fields": {"quantity": 2}}), *KEY, *SCOPE[1:]),
+            )
+        upgraded = Store(old)
+        upgraded.migrate()
+        upgraded.migrate()
+        with closing(upgraded.connect()) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (5,))
+            self.assertEqual(db.execute("SELECT id, status FROM outbox ORDER BY id").fetchall(),
+                             [(1, "uncertain"), (2, "not_sent")])
+            self.assertIsInstance(db.execute("SELECT finished_at FROM outbox WHERE id = 2").fetchone()[0], int)
+            fields, action_id = db.execute("SELECT fields, action_id FROM crm_desired").fetchone()
+            self.assertEqual((json.loads(fields), action_id), ({"quantity": 2}, 1))
 
 
 class RestContractTest(unittest.TestCase):

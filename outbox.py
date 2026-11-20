@@ -3,6 +3,12 @@ import time
 from contextlib import closing
 from dataclasses import dataclass
 
+HANDOFF_COOLDOWN = 60
+HANDOFF_RETRY_REASONS = {
+    "rate_limited", "permission_denied", "rejected_by_api", "verification_unavailable",
+    "scope_denied", "dry_run",
+}
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -46,33 +52,160 @@ def enqueue_actions(db, key, revision, version, metadata, plan):
         return
     db.execute(
         """UPDATE outbox SET status = 'cancelled', reason = 'newer_state'
-           WHERE (portal, chat, session) = (?, ?, ?) AND version < ? AND status = 'planned'""",
+           WHERE (portal, chat, session) = (?, ?, ?) AND version < ?
+             AND kind = 'message' AND status = 'planned'""",
         (*key, version),
     )
-    desired = []
+    route = metadata["line"], metadata["connector"]
     if plan.reply:
-        desired.append(("message", str(version), {"text": plan.reply}))
+        insert_action(db, key, revision, version, route, "message", str(version), {"text": plan.reply})
     if plan.handoff:
-        desired.append(("handoff", str(version), {}))
+        enqueue_handoff(db, key, revision, version, route)
     if plan.crm_fields:
-        binding = crm_link(db, key)
-        if binding:
-            entity_type, item = binding
-            desired.append(("crm_update", str(version), {
-                "entityTypeId": entity_type, "id": item, "fields": plan.crm_fields,
-            }))
-        elif plan.crm_create_type:
-            desired.append(("crm_create", str(version), {
-                "entityTypeId": plan.crm_create_type, "fields": plan.crm_fields,
-            }))
-    for kind, dedup, params in desired:
-        db.execute(
-            """INSERT INTO outbox (portal, chat, session, revision, version, line,
-                                   connector, kind, dedup, params)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            (*key, revision, version, metadata["line"], metadata["connector"],
-             kind, dedup, json.dumps(params, ensure_ascii=False)),
-        )
+        remember_crm(db, key, revision, version, route, plan)
+        schedule_crm(db, key)
+
+
+def insert_action(db, key, revision, version, route, kind, dedup, params):
+    return db.execute(
+        """INSERT INTO outbox (portal, chat, session, revision, version, line,
+                               connector, kind, dedup, params)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (*key, revision, version, *route, kind, dedup, json.dumps(params, ensure_ascii=False)),
+    ).lastrowid
+
+
+def enqueue_handoff(db, key, revision, version, route):
+    updated = db.execute(
+        """UPDATE outbox SET version = ?
+           WHERE (portal, chat, session) = (?, ?, ?) AND (revision, line, connector) = (?, ?, ?)
+             AND kind = 'handoff' AND status = 'planned'""",
+        (version, *key, revision, *route),
+    ).rowcount
+    if updated:
+        return
+    db.execute(
+        """UPDATE outbox SET status = 'cancelled', reason = 'newer_request'
+           WHERE (portal, chat, session) = (?, ?, ?) AND kind = 'handoff' AND status = 'planned'""",
+        key,
+    )
+    blocker = db.execute(
+        """SELECT id FROM outbox
+           WHERE (portal, chat, session) = (?, ?, ?) AND kind = 'handoff'
+             AND (status != 'cancelled' OR reason = 'local_state_changed')
+           ORDER BY id DESC LIMIT 1""",
+        key,
+    ).fetchone()
+    if blocker is None:
+        insert_action(db, key, revision, version, route, "handoff", str(version), {})
+        return
+    db.execute(
+        """INSERT INTO handoff_waiting (portal, chat, session, revision, version, line, connector, blocked_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (portal, chat, session) DO UPDATE SET
+               revision = excluded.revision, version = excluded.version, line = excluded.line,
+               connector = excluded.connector, blocked_by = excluded.blocked_by""",
+        (*key, revision, version, *route, blocker[0]),
+    )
+
+
+def session_version(db, key, revision):
+    result = db.execute(
+        """SELECT s.version FROM sessions AS s
+           JOIN chat_heads AS h ON (h.portal, h.chat, h.session) = (s.portal, s.chat, s.session)
+           WHERE (s.portal, s.chat, s.session) = (?, ?, ?) AND h.revision = ? AND h.owner = 'bot'
+             AND s.state NOT IN ('HUMAN_ACTIVE', 'CLOSED', 'DO_NOT_CONTACT')
+             AND NOT EXISTS (
+                 SELECT 1 FROM inbox AS i
+                 WHERE (i.portal, i.chat, i.session) = (s.portal, s.chat, s.session)
+                   AND i.processed = 0 AND i.kind IN ('human', 'closed', 'stop')
+             )""",
+        (*key, revision),
+    ).fetchone()
+    return result[0] if result is not None else None
+
+
+def remember_crm(db, key, revision, version, route, plan):
+    previous = db.execute(
+        "SELECT fields, line, connector FROM crm_desired WHERE (portal, chat, session) = (?, ?, ?)", key,
+    ).fetchone()
+    if previous and previous[1:] != route:
+        raise ValueError("Маршрут CRM для сессии изменился")
+    fields = json.loads(previous[0]) if previous else {}
+    fields.update(plan.crm_fields)
+    db.execute(
+        """INSERT INTO crm_desired (portal, chat, session, revision, version, line, connector, fields, create_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (portal, chat, session) DO UPDATE SET
+               revision = excluded.revision, version = excluded.version, line = excluded.line,
+               connector = excluded.connector, fields = excluded.fields, create_type = excluded.create_type,
+               action_id = NULL, reason = NULL""",
+        (*key, revision, version, *route, json.dumps(fields, ensure_ascii=False), plan.crm_create_type),
+    )
+    db.execute(
+        """UPDATE outbox SET status = 'cancelled', reason = 'newer_crm_data'
+           WHERE (portal, chat, session) = (?, ?, ?) AND kind IN ('crm_create', 'crm_update')
+             AND status = 'planned'""",
+        key,
+    )
+
+
+def schedule_crm(db, key):
+    desired = db.execute(
+        """SELECT id, revision, version, line, connector, fields, create_type
+           FROM crm_desired WHERE (portal, chat, session) = (?, ?, ?) AND action_id IS NULL""",
+        key,
+    ).fetchone()
+    if desired is None:
+        return
+    desired_id, revision, version, line, connector, fields, create_type = desired
+    current = session_version(db, key, revision)
+    binding = crm_link(db, key)
+    reason = crm_wait_reason(db, key, current, binding, create_type)
+    if reason:
+        db.execute("UPDATE crm_desired SET reason = ? WHERE id = ?", (reason, desired_id))
+        return
+    params = {"fields": json.loads(fields), "entityTypeId": binding[0] if binding else create_type}
+    if binding:
+        params["id"] = binding[1]
+    kind = "crm_update" if binding else "crm_create"
+    action_id = insert_action(db, key, revision, current, (line, connector), kind, str(version), params)
+    db.execute("UPDATE crm_desired SET action_id = ?, reason = NULL WHERE id = ?", (action_id, desired_id))
+
+
+def reconsider_crm(db, key):
+    schedule_crm(db, key)
+    active = db.execute(
+        "SELECT session FROM chat_heads WHERE (portal, chat) = (?, ?)", key[:2],
+    ).fetchone()
+    if active and active[0] != key[2]:
+        schedule_crm(db, (*key[:2], active[0]))
+
+
+def crm_wait_reason(db, key, current, binding, create_type):
+    if current is None:
+        return "session_unavailable"
+    unresolved = db.execute(
+        """SELECT 1 FROM outbox WHERE (portal, chat) = (?, ?)
+           AND status IN ('in_flight', 'api_accepted', 'uncertain')
+           AND (kind = 'crm_create' OR (kind = 'crm_update' AND session = ?)) LIMIT 1""",
+        key,
+    ).fetchone()
+    if unresolved:
+        return "crm_attempt_unresolved"
+    if binding:
+        return None
+    existing = db.execute(
+        """SELECT 1 FROM crm_links WHERE (portal, chat) = (?, ?)
+           UNION ALL
+           SELECT 1 FROM outbox WHERE (portal, chat) = (?, ?)
+             AND kind = 'crm_create' AND status != 'cancelled'
+           LIMIT 1""",
+        (*key[:2], *key[:2]),
+    ).fetchone()
+    if existing or not create_type:
+        return "waiting_session_binding"
+    return None
 
 
 def crm_link(db, key):
@@ -123,19 +256,12 @@ class Dispatcher:
     def can_dispatch(self, action):
         with closing(self.store.connect()) as db:
             db.execute("BEGIN")
+            if session_version(db, action.key, action.revision) != action.version:
+                return False
             return db.execute(
                 """SELECT EXISTS (
                        SELECT 1 FROM outbox AS o
-                       JOIN chat_heads AS h ON (h.portal, h.chat) = (o.portal, o.chat)
-                       JOIN sessions AS s ON (s.portal, s.chat, s.session) = (o.portal, o.chat, o.session)
                        WHERE o.id = ? AND o.status = 'in_flight'
-                         AND h.session = o.session AND h.revision = o.revision AND h.owner = 'bot'
-                         AND s.version = o.version AND s.state NOT IN ('HUMAN_ACTIVE', 'CLOSED', 'DO_NOT_CONTACT')
-                         AND NOT EXISTS (
-                             SELECT 1 FROM inbox AS i
-                             WHERE (i.portal, i.chat, i.session) = (o.portal, o.chat, o.session)
-                               AND i.processed = 0 AND i.kind IN ('human', 'closed', 'stop')
-                         )
                          AND (o.kind != 'message' OR NOT EXISTS (
                              SELECT 1 FROM outbox AS hnd
                              WHERE (hnd.portal, hnd.chat, hnd.session) = (o.portal, o.chat, o.session)
@@ -185,9 +311,9 @@ class Dispatcher:
     def finish(self, action, outcome):
         with closing(self.store.connect()) as db, db:
             changed = db.execute(
-                """UPDATE outbox SET status = ?, reason = ?
+                """UPDATE outbox SET status = ?, reason = ?, finished_at = ?
                    WHERE id = ? AND status = 'in_flight'""",
-                (outcome.status, outcome.reason, action.id),
+                (outcome.status, outcome.reason, int(time.time()), action.id),
             ).rowcount
             if changed and action.kind == "crm_create" and outcome.crm_item:
                 if not record_crm_link(db, action.key, action.params["entityTypeId"], outcome.crm_item):
@@ -195,6 +321,11 @@ class Dispatcher:
                         "UPDATE outbox SET status = 'uncertain', reason = 'crm_binding_conflict' WHERE id = ?",
                         (action.id,),
                     )
+            if changed and action.kind == "crm_create" and outcome.status in ("not_sent", "cancelled"):
+                if crm_link(db, action.key):
+                    db.execute("UPDATE crm_desired SET action_id = NULL WHERE action_id = ?", (action.id,))
+            if changed and action.kind in ("crm_create", "crm_update"):
+                reconsider_crm(db, action.key)
 
     def recover_expired(self, *, grace_seconds=60):
         if grace_seconds < 60:
@@ -226,10 +357,73 @@ class Dispatcher:
                     return False
             elif crm_item is not None:
                 return False
-            return db.execute(
+            changed = db.execute(
                 "UPDATE outbox SET status = 'confirmed', reason = NULL WHERE id = ?",
                 (action_id,),
             ).rowcount == 1
+            if changed and kind in ("crm_create", "crm_update"):
+                reconsider_crm(db, (portal, chat, session))
+            return changed
+
+    def bind_crm(self, projection_id, entity_type, item):
+        """Сохраняет независимо подтверждённую привязку карточки для выбранной сессии."""
+        if any(type(value) is not int or value <= 0 for value in (entity_type, item)):
+            return False
+        with closing(self.store.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            key = db.execute(
+                "SELECT portal, chat, session FROM crm_desired WHERE id = ?", (projection_id,),
+            ).fetchone()
+            if key is None or not record_crm_link(db, key, entity_type, item):
+                return False
+            # Привязка разрешает обновление вместо ещё не начатого создания.
+            db.execute(
+                """UPDATE outbox SET status = 'cancelled', reason = 'crm_binding_verified'
+                   WHERE id = (SELECT action_id FROM crm_desired WHERE id = ?)
+                     AND kind = 'crm_create' AND status = 'planned'""",
+                (projection_id,),
+            )
+            db.execute(
+                """UPDATE crm_desired SET action_id = NULL WHERE id = ? AND action_id IN (
+                       SELECT id FROM outbox WHERE kind = 'crm_create'
+                         AND (status = 'not_sent' OR (status = 'cancelled' AND reason = 'crm_binding_verified'))
+                   )""",
+                (projection_id,),
+            )
+            schedule_crm(db, key)
+            return True
+
+    def retry_handoff(self, failed_action_id):
+        """Разрешает одну новую попытку по зафиксированной просьбе после доказанного отказа."""
+        with closing(self.store.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            request = db.execute(
+                """SELECT w.portal, w.chat, w.session, w.revision, w.version, w.line, w.connector,
+                          o.status, o.reason, o.finished_at
+                   FROM handoff_waiting AS w JOIN outbox AS o ON o.id = w.blocked_by
+                   WHERE w.blocked_by = ? AND (w.portal, w.chat, w.session) = (o.portal, o.chat, o.session)
+                     AND w.version > o.version""",
+                (failed_action_id,),
+            ).fetchone()
+            if request is None:
+                return False
+            portal, chat, session, revision, requested, line, connector, status, reason, finished_at = request
+            definitively_failed = status == "not_sent" and reason in HANDOFF_RETRY_REASONS
+            cancelled_locally = status == "cancelled" and reason == "local_state_changed"
+            if not (definitively_failed or cancelled_locally):
+                return False
+            if finished_at is None or int(time.time()) - finished_at < HANDOFF_COOLDOWN:
+                return False
+            key = portal, chat, session
+            version = session_version(db, key, revision)
+            if version is None:
+                return False
+            insert_action(
+                db, key, revision, version, (line, connector), "handoff",
+                f"retry:{failed_action_id}:{requested}", {},
+            )
+            db.execute("DELETE FROM handoff_waiting WHERE (portal, chat, session) = (?, ?, ?)", key)
+            return True
 
     def review_queue(self):
         with closing(self.store.connect()) as db:
@@ -239,4 +433,22 @@ class Dispatcher:
                       OR (status = 'not_sent' AND reason != 'dry_run')
                    ORDER BY id"""
             )
-            return [dict(zip(("id", "kind", "status", "reason"), row)) for row in rows]
+            review = [dict(zip(("id", "kind", "status", "reason"), row)) for row in rows]
+            review.extend(
+                {"id": projection_id, "kind": "crm_projection", "status": "deferred", "reason": reason}
+                for projection_id, reason in db.execute(
+                    """SELECT d.id, coalesce(d.reason, o.reason, 'waiting_session_binding')
+                       FROM crm_desired AS d LEFT JOIN outbox AS o ON o.id = d.action_id
+                       WHERE d.action_id IS NULL OR o.status = 'cancelled'
+                       ORDER BY d.id"""
+                )
+            )
+            review.extend(
+                {"id": blocker, "kind": "handoff_request", "status": "deferred", "reason": reason}
+                for blocker, reason in db.execute(
+                    """SELECT w.blocked_by, coalesce(o.reason, o.status)
+                       FROM handoff_waiting AS w JOIN outbox AS o ON o.id = w.blocked_by
+                       ORDER BY w.blocked_by"""
+                )
+            )
+            return review
